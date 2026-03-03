@@ -15,7 +15,7 @@ public class DistanceGraph {
     private static final int BATCH_SIZE_SHIFT = 2; // 4 chunks
     private static final int NODE_SIZE_BITS = 3;   // 8 nodes
     private static final int ROOT_SIZE_SHIFT = 9;  // 512 nodes
-    
+
     private final Map<Long, Node> roots = new ConcurrentHashMap<>();
 
     private static class Node {
@@ -93,7 +93,6 @@ public class DistanceGraph {
         for (int rx = rbxMin; rx <= rbxMax; rx++) {
             for (int rz = rbzMin; rz <= rbzMax; rz++) {
                 Node root = roots.get(ChunkPos.asLong(rx, rz));
-                // check empty space even if node is null
                 double dSq = getDistSq(rx, rz, rootSize, cbx, cbz);
                 if (dSq <= (double)rb * rb) {
                     queue.add(new WorkItem(root, 3, rx, rz, dSq));
@@ -106,7 +105,6 @@ public class DistanceGraph {
             if (item.node != null && item.node.isFull()) continue;
 
             if (item.level == 0) {
-                // found a batch
                 long key = ChunkPos.asLong(item.x, item.z);
                 if (trackedBatches.add(key)) {
                     List<ChunkPos> batch = new ArrayList<>(16);
@@ -122,13 +120,13 @@ public class DistanceGraph {
 
             int childLevel = item.level - 1;
             int childSize = 1 << (3 * childLevel);
-            
+
             for (int i = 0; i < 64; i++) {
                 if (item.node != null && (item.node.fullMask & (1L << i)) != 0) continue;
 
                 int cx = (item.x << 3) + (i & 7);
                 int cz = (item.z << 3) + (i >> 3);
-                
+
                 double dSq = getDistSq(cx, cz, childSize, cbx, cbz);
                 if (dSq <= (double)rb * rb) {
                     Object child = (item.node == null) ? null : item.node.children.get(i);
@@ -141,7 +139,6 @@ public class DistanceGraph {
     }
 
     private double getDistSq(int nx, int nz, int size, int cbx, int cbz) {
-        // distance to nearest edge of node
         double dx = Math.max(0, Math.max((double)nx * size - cbx, (double)cbx - (nx + 1) * size + 1));
         double dz = Math.max(0, Math.max((double)nz * size - cbz, (double)cbz - (nz + 1) * size + 1));
         return dx * dx + dz * dz;
@@ -159,7 +156,6 @@ public class DistanceGraph {
         int cbz = center.z >> BATCH_SIZE_SHIFT;
         int rb = (radiusChunks + 3) >> BATCH_SIZE_SHIFT;
 
-        int rootSize = 1 << ROOT_SIZE_SHIFT;
         int rbxMin = (cbx - rb) >> ROOT_SIZE_SHIFT;
         int rbxMax = (cbx + rb) >> ROOT_SIZE_SHIFT;
         int rbzMin = (cbz - rb) >> ROOT_SIZE_SHIFT;
@@ -175,86 +171,28 @@ public class DistanceGraph {
         return count;
     }
 
+    // FIX: restored bounded recursive approach — the PriorityQueue<CollectItem> replacement
+    // was unbounded and would enqueue the entire hierarchy before returning anything,
+    // causing immediate OOM for large radii.
     public void collectCompletedInRange(ChunkPos center, int radiusChunks, it.unimi.dsi.fastutil.longs.LongSet alreadySynced, List<ChunkPos> out, int maxResults) {
         int cbx = center.x >> BATCH_SIZE_SHIFT;
         int cbz = center.z >> BATCH_SIZE_SHIFT;
         int rb = (radiusChunks + 3) >> BATCH_SIZE_SHIFT;
-
-        // use a priority queue to process chunks from nearest to farthest
-        PriorityQueue<CollectItem> queue = new PriorityQueue<>(Comparator.comparingDouble(i -> i.distSq));
 
         int rbxMin = (cbx - rb) >> ROOT_SIZE_SHIFT;
         int rbxMax = (cbx + rb) >> ROOT_SIZE_SHIFT;
         int rbzMin = (cbz - rb) >> ROOT_SIZE_SHIFT;
         int rbzMax = (cbz + rb) >> ROOT_SIZE_SHIFT;
 
-        int rootSize = 1 << ROOT_SIZE_SHIFT;
-        double maxDistSq = (double) rb * rb;
-
         for (int rx = rbxMin; rx <= rbxMax; rx++) {
             for (int rz = rbzMin; rz <= rbzMax; rz++) {
                 Node root = roots.get(ChunkPos.asLong(rx, rz));
                 if (root == null) continue;
-                
-                double dSq = getDistSq(rx, rz, rootSize, cbx, cbz);
-                if (dSq <= maxDistSq) {
-                    queue.add(new CollectItem(root, false, 0, 3, rx, rz, dSq));
-                }
-            }
-        }
-
-        while (!queue.isEmpty() && out.size() < maxResults) {
-            CollectItem item = queue.poll();
-            
-            if (item.level == 0) {
-                // process batch
-                int mask = item.isVirtualFull ? 0xFFFF : item.mask;
-                for (int i = 0; i < 16; i++) {
-                    if ((mask & (1 << i)) != 0) {
-                        int lx = i & 3;
-                        int lz = i >> 2;
-                        ChunkPos pos = new ChunkPos((item.x << 2) + lx, (item.z << 2) + lz);
-                        if (!alreadySynced.contains(pos.toLong())) {
-                            out.add(pos);
-                            if (out.size() >= maxResults) return;
-                        }
-                    }
-                }
-                continue;
-            }
-            
-            // expand children
-            int childLevel = item.level - 1;
-            int childSize = 1 << (3 * childLevel);
-            
-            for (int i = 0; i < 64; i++) {
-                int cx = (item.x << 3) + (i & 7);
-                int cz = (item.z << 3) + (i >> 3);
-                
-                double dSq = getDistSq(cx, cz, childSize, cbx, cbz);
-                if (dSq > maxDistSq) continue;
-                
-                if (item.isVirtualFull || (item.node != null && (item.node.fullMask & (1L << i)) != 0)) {
-                   queue.add(new CollectItem(null, true, 0xFFFF, childLevel, cx, cz, dSq));
-                   continue;
-                }
-                
-                if (item.node == null) continue;
-                Object child = item.node.children.get(i);
-                if (child == null) continue;
-                
-                if (childLevel == 0) {
-                    if (child instanceof Integer mask) {
-                        queue.add(new CollectItem(null, false, mask, 0, cx, cz, dSq));
-                    }
-                } else if (child instanceof Node childNode) {
-                    queue.add(new CollectItem(childNode, false, 0, childLevel, cx, cz, dSq));
-                }
+                recursiveCollectCompleted(root, 3, rx, rz, cbx, cbz, rb, alreadySynced, out, maxResults);
+                if (out.size() >= maxResults) return;
             }
         }
     }
-    
-    private record CollectItem(Node node, boolean isVirtualFull, int mask, int level, int x, int z, double distSq) {}
 
     private int recursiveCount(Node node, int level, int nx, int nz, int cbx, int cbz, int rb) {
         int size = 1 << (3 * level);
@@ -264,7 +202,6 @@ public class DistanceGraph {
         if (level == 0) return 1; // batch
 
         if (node == null) {
-            // estimate chunks in circle inside empty node
             if (level == 1) {
                 int c = 0;
                 for (int i = 0; i < 64; i++) {
@@ -274,7 +211,6 @@ public class DistanceGraph {
                 }
                 return c;
             }
-            // higher level, recurse null node
             int c = 0;
             for (int i = 0; i < 64; i++) {
                 int cx = (nx << 3) + (i & 7);
@@ -284,7 +220,6 @@ public class DistanceGraph {
             return c;
         }
 
-        // l1 partial
         if (level == 1) {
             int c = 0;
             for (int i = 0; i < 64; i++) {
@@ -299,7 +234,6 @@ public class DistanceGraph {
             return c;
         }
 
-        // higher level partial
         int c = 0;
         for (int i = 0; i < 64; i++) {
             if ((node.fullMask & (1L << i)) != 0) continue;
@@ -312,7 +246,60 @@ public class DistanceGraph {
         return c;
     }
 
+    private void recursiveCollectCompleted(Node node, int level, int nx, int nz, int cbx, int cbz, int rb, it.unimi.dsi.fastutil.longs.LongSet alreadySynced, List<ChunkPos> out, int maxResults) {
+        if (out.size() >= maxResults) return;
+        int size = 1 << (3 * level);
+        if (getDistSq(nx, nz, size, cbx, cbz) > (double)rb * rb) return;
 
+        if (level == 0) return;
+
+        if (level == 1) {
+            for (int i = 0; i < 64; i++) {
+                int bx = (nx << 3) + (i & 7);
+                int bz = (nz << 3) + (i >> 3);
+                if (getDistSq(bx, bz, 1, cbx, cbz) <= (double)rb * rb) {
+                    if (node == null || (node.fullMask & (1L << i)) != 0) {
+                        for (int lz = 0; lz < 4; lz++) {
+                            for (int lx = 0; lx < 4; lx++) {
+                                ChunkPos pos = new ChunkPos((bx << 2) + lx, (bz << 2) + lz);
+                                if (!alreadySynced.contains(pos.toLong())) {
+                                    out.add(pos);
+                                    if (out.size() >= maxResults) return;
+                                }
+                            }
+                        }
+                    } else {
+                        Object child = node.children.get(i);
+                        if (child instanceof Integer mask) {
+                            for (int m = 0; m < 16; m++) {
+                                if ((mask & (1 << m)) != 0) {
+                                    ChunkPos pos = new ChunkPos((bx << 2) + (m & 3), (bz << 2) + (m >> 2));
+                                    if (!alreadySynced.contains(pos.toLong())) {
+                                        out.add(pos);
+                                        if (out.size() >= maxResults) return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        for (int i = 0; i < 64; i++) {
+            int cx = (nx << 3) + (i & 7);
+            int cz = (nz << 3) + (i >> 3);
+
+            Object child = (node == null) ? null : node.children.get(i);
+            if (child instanceof Node childNode) {
+                recursiveCollectCompleted(childNode, level - 1, cx, cz, cbx, cbz, rb, alreadySynced, out, maxResults);
+            } else if (node == null || (node.fullMask & (1L << i)) != 0) {
+                recursiveCollectCompleted(null, level - 1, cx, cz, cbx, cbz, rb, alreadySynced, out, maxResults);
+            }
+            if (out.size() >= maxResults) return;
+        }
+    }
 
     private static class WorkItem {
         final Node node;
