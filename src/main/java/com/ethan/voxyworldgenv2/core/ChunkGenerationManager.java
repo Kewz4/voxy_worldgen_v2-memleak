@@ -37,6 +37,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class ChunkGenerationManager {
     private static final ChunkGenerationManager INSTANCE = new ChunkGenerationManager();
 
+    // overkill: how many batches to dispatch per worker cycle
+    private static final int BATCHES_PER_CYCLE = 256;
+
     private static class DimensionState {
         final ServerLevel level;
         final LongSet completedChunks = LongSets.synchronize(new LongOpenHashSet());
@@ -99,7 +102,6 @@ public final class ChunkGenerationManager {
     public void initialize(MinecraftServer server) {
         this.server = server;
         this.running.set(true);
-        // unpaused by default
         this.pauseCheck = () -> false;
         Config.load();
         this.throttle = new Semaphore(Config.DATA.maxActiveTasks);
@@ -134,6 +136,7 @@ public final class ChunkGenerationManager {
         if (workerRunning.getAndSet(true)) return;
         workerThread = new Thread(this::workerLoop, "Voxy-WorldGen-Worker");
         workerThread.setDaemon(true);
+        workerThread.setPriority(Thread.MAX_PRIORITY);
         workerThread.start();
     }
 
@@ -169,11 +172,12 @@ public final class ChunkGenerationManager {
                     continue;
                 }
 
-                // dispatch multiple batches per iteration to saturate maxActiveTasks
+                // collect all pending work across all players into one big list
+                // then fire it all at the server in a single execute() call
+                List<PendingWork> allWork = new ArrayList<>(BATCHES_PER_CYCLE * 16);
                 int batchesDispatched = 0;
-                int maxBatchesPerCycle = Math.max(1, Config.DATA.maxActiveTasks / 4);
 
-                while (batchesDispatched < maxBatchesPerCycle) {
+                while (batchesDispatched < BATCHES_PER_CYCLE) {
                     List<ChunkPos> batch = null;
                     DimensionState activeState = null;
 
@@ -194,7 +198,6 @@ public final class ChunkGenerationManager {
                     long batchKey = DistanceGraph.getBatchKey(batch.get(0).x, batch.get(0).z);
                     finalState.batchCounters.put(batchKey, new AtomicInteger(batch.size()));
 
-                    // skip if already tracked locally
                     List<ChunkPos> preFiltered = new ArrayList<>(batch.size());
                     for (ChunkPos pos : batch) {
                         long key = pos.toLong();
@@ -211,21 +214,13 @@ public final class ChunkGenerationManager {
                         continue;
                     }
 
-                    // dispatch tasks
                     List<ChunkPos> readyToGenerate = new ArrayList<>();
                     int processedCount = 0;
+
                     for (ChunkPos pos : preFiltered) {
                         if (!workerRunning.get()) break;
-
-                        boolean acquired = false;
-                        try {
-                            acquired = throttle.tryAcquire(50, java.util.concurrent.TimeUnit.MILLISECONDS);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-
-                        if (!acquired) break;
+                        // non-blocking tryAcquire — if throttle is full, stop queuing
+                        if (!throttle.tryAcquire()) break;
 
                         processedCount++;
                         if (finalState.trackedChunks.add(pos.toLong())) {
@@ -253,12 +248,20 @@ public final class ChunkGenerationManager {
                     }
 
                     if (!readyToGenerate.isEmpty()) {
-                        final List<ChunkPos> finalReadyToGenerate = readyToGenerate;
-                        server.execute(() -> {
+                        allWork.add(new PendingWork(finalState, readyToGenerate));
+                    }
+                }
+
+                // fire all collected work in a single server.execute() call
+                if (!allWork.isEmpty()) {
+                    final List<PendingWork> finalAllWork = allWork;
+                    server.execute(() -> {
+                        for (PendingWork work : finalAllWork) {
+                            DimensionState finalState = work.state();
                             ServerChunkCache cache = finalState.level.getChunkSource();
                             List<ChunkPos> actuallyGenerate = new ArrayList<>();
 
-                            for (ChunkPos pos : finalReadyToGenerate) {
+                            for (ChunkPos pos : work.chunks()) {
                                 if (finalState.level.hasChunk(pos.x, pos.z)) {
                                     LevelChunk existingChunk = finalState.level.getChunk(pos.x, pos.z);
                                     if (existingChunk != null && !existingChunk.isEmpty()) {
@@ -274,7 +277,6 @@ public final class ChunkGenerationManager {
                             }
 
                             if (!actuallyGenerate.isEmpty()) {
-                                // apply tickets immediately to ensure DistanceManager is aware of them
                                 processPendingTickets();
 
                                 for (ChunkPos pos : actuallyGenerate) {
@@ -293,12 +295,12 @@ public final class ChunkGenerationManager {
                                         }, server);
                                 }
                             }
-                        });
-                    }
+                        }
+                    });
                 }
 
                 if (batchesDispatched == 0) {
-                    // no generation work found — try to catch up on syncing for any player
+                    // no generation work — try to sync
                     boolean workDispatched = false;
                     for (ServerPlayer player : players) {
                         var synced = PlayerTracker.getInstance().getSyncedChunks(player.getUUID());
@@ -331,9 +333,10 @@ public final class ChunkGenerationManager {
 
                     if (workDispatched) continue;
 
-                    Thread.sleep(100);
+                    Thread.sleep(50);
                 }
 
+                // no sleep when there's work — spin as fast as possible
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
@@ -343,6 +346,9 @@ public final class ChunkGenerationManager {
             }
         }
     }
+
+    // groups a state with its ready-to-generate chunks for bulk dispatch
+    private record PendingWork(DimensionState state, List<ChunkPos> chunks) {}
 
     public void tick() {
         if (!running.get() || server == null) return;
@@ -359,7 +365,6 @@ public final class ChunkGenerationManager {
         stats.tick();
         checkPlayerMovement();
 
-        // broadcast changes for all active dimensions
         Set<ServerLevel> activeLevels = new HashSet<>();
         for (ServerPlayer player : PlayerTracker.getInstance().getPlayers()) {
             activeLevels.add((ServerLevel) player.level());
@@ -392,7 +397,6 @@ public final class ChunkGenerationManager {
             }
         }
 
-        // majority check for currentLevel - only switch when a candidate strictly exceeds the current level's count
         ServerLevel majorLevel = currentLevel;
         int maxCount = levelCounts.getOrDefault(currentLevel, 0);
 
@@ -408,7 +412,6 @@ public final class ChunkGenerationManager {
             return;
         }
 
-        // clean up players who left
         Set<java.util.UUID> currentPlayerIds = new java.util.HashSet<>();
         for (ServerPlayer p : players) currentPlayerIds.add(p.getUUID());
         if (lastPlayerPositions.size() > currentPlayerIds.size()) {
